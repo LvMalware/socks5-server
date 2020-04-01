@@ -1,12 +1,13 @@
 #!/usr/bin/env perl
 
-#use utf8;
+#by LvMalware <https://github.com/LvMalware>
+
+use utf8;
 use strict;
 use threads;
 use warnings;
 use IO::Socket::INET;
 use Encode qw(encode);
-#use open IO  => ':encoding(UTF-8)';
 
 use constant SOCKS_VERSION => 5;
 
