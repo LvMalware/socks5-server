@@ -77,8 +77,8 @@ sub server_loop
         }
         else
         {
+            add_log("$cli_host - no authentication needed.");
             $client->send(pack("CC", SOCKS_VERSION, 0));
-
         }
         my $request_header;
         $client->recv($request_header, 4);
