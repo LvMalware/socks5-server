@@ -1,3 +1,4 @@
+use utf8;
 use strict;
 use threads;
 use warnings;
@@ -5,7 +6,7 @@ use IO::Select;
 use threads::shared;
 use IO::Socket::INET;
 use Encode qw(encode decode);
-
+use open IO  => ':encoding(UTF-8)';
 use constant SOCKS_VERSION => 5;
 my ($username, $password);
 share($username);
@@ -30,11 +31,12 @@ sub start_proxy
         Listen    => 5,
         LocalAddr => $host,
         LocalPort => $port,
-        Proto     => 'tcp'
+        Proto     => 'tcp',
+        ReuseAddr => 1
     ) || die "Can't create the server: $!";
     threads->create('thread_server', $server)->join();
 }
-$SIG{'KILL'} = \&stop_proxy;
+
 sub stop_proxy
 {
     my @threads = threads->list();
@@ -47,13 +49,8 @@ sub stop_proxy
 sub thread_server
 {
     my ($server) = @_;
-    $SIG{'KILL'} = sub {
-        $server->shutdown(2);
-        $server->close();
-        $server = undef;
-        print "???\n";
-    };
-    while ($server)
+    $SIG{'KILL'} = sub { $server->shutdown(2); $server->close(); undef($server) };
+    while (defined($server))
     {
         my $client   = $server->accept();
         my $cli_host = $client->peerhost();
@@ -63,7 +60,7 @@ sub thread_server
         #receive the greeting header
         $client->recv($header, 2);
         #unpack the version and methods
-        my ($version, $nmethods) = unpack("WW", $header);
+        my ($version, $nmethods) = unpack("CC", $header);
         #verify if the requested version is supported
         unless ($version == SOCKS_VERSION)
         {
@@ -87,13 +84,12 @@ sub thread_server
             add_log("$cli_host must authenticate first.");
             next;
         }
-        $client->send(pack("WW", SOCKS_VERSION, 2));
-        $|=1;
+        $client->send(pack("CC", SOCKS_VERSION, 2));
         if (authenticate_client($client))
         {
             my $data;
             $client->recv($data, 4);
-            my ($version, $cmd, $foo, $addr_type) = unpack("WWWW", $data);
+            my ($version, $cmd, $foo, $addr_type) = unpack("CCCC", $data);
             unless ($version == SOCKS_VERSION)
             {
                 $client->close();
@@ -114,6 +110,12 @@ sub thread_server
                 $client->recv($len, 1);
                 $len = ord($len);
                 $client->recv($address, $len);
+            }
+            elsif ($addr_type == 4) #IPv6
+            {
+                add_log("$cli_host requested IPv6 connection");
+                $client->recv($address, 16);
+                $address = inet_ntop(AF_INET6, $address);
             }
             my $port;
             $client->recv($port, 2);
@@ -138,12 +140,13 @@ sub thread_server
                 add_log($client->peerhost() . " invalid command");
                 next;
             }
-            my ($myport, $myaddr) = sockaddr_in(getsockname($target));
-            $client->send(pack("WWWWIH", SOCKS_VERSION, 0, 0, $addr_type, unpack("I", $myaddr), $port));
-            $|++;
+            my @bind_addr = sockaddr_in(getsockname($target));
+            my ($myport, $myaddr) = ($bind_addr[0], unpack("I", $bind_addr[1]));
+            my $ok = $client->send(pack("CCCC", SOCKS_VERSION, 0, 0, $addr_type) . inet_aton("0.0.0.0") . pack("H", $myport));
+            ($client->close() && next) unless ($ok > 0);
             if ($cmd == 1)
             {
-                threads->create('handle_client', $client, $target);
+                threads->create('handle_client', $client, $target)->join();
             }
             else
             {
@@ -159,13 +162,6 @@ sub authenticate_client
     my ($client) = @_;
     my $version;
     $client->recv($version, 1);
-    unless (ord($version) == 1)
-    {
-        $client->shutdown(2);
-        $client->close();
-        add_log($client->peerhost() . " invalid authentication version");
-        return 0;
-    }
     my ($usr_len, $pwd_len, $user, $pass);
     $client->recv($usr_len, 1);
     $client->recv($user, ord($usr_len));
@@ -175,16 +171,13 @@ sub authenticate_client
     $pass = encode('utf-8', $pass);
     if (($user eq $username) and ($pass eq $password))
     {
-        $client->send(pack("WW", ord($version), 0));
-        $|++;
+        $client->send(pack("CC", ord($version), 0));
         add_log($client->peerhost() . " authenticated.");
     }
     else
     {
-        $client->send(pack("WW", $version, 0xFF));
-        $|++;
-        $client->shutdown(2);
-        client->close();
+        eval { $client->send(pack("CC", ord($version), 0xFF)); client->close(); };
+        
         add_log($client->peerhost() . " invalid username and/or password");
         return 0;
     }
@@ -194,7 +187,7 @@ sub authenticate_client
 sub err_replay
 {
     my ($client, $addr_type, $err_number) = @_;
-    $client->send(pack("WWWWIH", SOCKS_VERSION, $err_number, 0, $addr_type, 0, 0));
+    $client->send(pack("CCCCIH", SOCKS_VERSION, $err_number, 0, $addr_type, 0, 0));
     $|++;
     $client->shutdown(2);
     $client->close()
@@ -203,36 +196,45 @@ sub err_replay
 sub handle_client
 {
     my ($client, $target) = @_;
-    $SIG{'KILL'} = sub {
-        $target->shutdown(2);
-        $client->shutdown(2);
-        $target->close();
-        $client->close();
-        undef($target);
-        undef($client);
-    };
-    my $select = IO::Select->new();
-    $select->add($client, $target);
+    my $host = $client->peerhost();
+    my $targ = $target->peerhost();
+    add_log("handling connection from $host with $targ");
     while (defined($client))
     {
-        my $data;
-        my @ready = $select->can_read();
-        for my $sock (@ready)
+        my @ready = IO::Select->new($client, $target)->can_read();
+        foreach my $sock (@ready)
         {
-            if ($sock->peerhost() eq $client->peerhost())
+            my $data = "";
+            if ($sock == $client)
             {
                 $client->recv($data, 4096);
-                next unless length($data);
-                last unless ($target->send("$data\n") > 0);
+                if ((length($data) == 0) || ($target->send($data) < length($data)))
+                {
+                    $client->close();
+                    $target->close();
+                    $client = undef;
+                    $target = undef;
+                    next;
+                }
+                #$|++;
             }
-            else
+            elsif ($sock ==  $target)
             {
                 $target->recv($data, 4096);
-                next unless length($data);
-                last unless ($client->send("$data\n") > 0);
+                if ((length($data) == 0) || ($client->send($data) < length($data)))
+                {
+                    $client->close();
+                    $target->close();
+                    $client = undef;
+                    $target = undef;
+                    next;
+                }
+                #$|++;
             }
         }
     }
+    add_log("$host disconnected.");
+    threads->exit();
 }
 
 start_proxy();
